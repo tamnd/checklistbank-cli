@@ -25,9 +25,9 @@ func TestDomainInfo(t *testing.T) {
 
 func TestClassify(t *testing.T) {
 	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+		{"abc123", "taxon", "abc123"},
+		{"  xyz-789  ", "taxon", "xyz-789"},
+		{"R_3454", "taxon", "R_3454"},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
@@ -38,11 +38,31 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+func TestClassifyEmpty(t *testing.T) {
+	_, _, err := Domain{}.Classify("")
+	if err == nil {
+		t.Error("expected error for empty input")
+	}
+}
+
 func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
+	got, err := Domain{}.Locate("taxon", "abc123")
+	want := "https://api.checklistbank.org/nameusage/abc123"
 	if err != nil || got != want {
 		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
+	}
+
+	got, err = Domain{}.Locate("checklist", "9")
+	want = "https://www.checklistbank.org/dataset/9"
+	if err != nil || got != want {
+		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
+	}
+}
+
+func TestLocateUnknownType(t *testing.T) {
+	_, err := Domain{}.Locate("species", "abc")
+	if err == nil {
+		t.Error("expected error for unknown resource type")
 	}
 }
 
@@ -56,21 +76,17 @@ func TestHostWiring(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
+	tx := &Taxon{ID: "abc123", ScientificName: "Homo sapiens", Rank: "species", Label: "Homo sapiens Linnaeus, 1758"}
+	u, err := h.Mint(tx)
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if want := "checklistbank://page/wiki/Go"; u.String() != want {
+	if want := "checklistbank://taxon/abc123"; u.String() != want {
 		t.Errorf("Mint = %q, want %q", u.String(), want)
 	}
 
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("checklistbank", "about")
-	if err != nil || got.String() != "checklistbank://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want checklistbank://page/about", got.String(), err)
+	got, err := h.ResolveOn("checklistbank", "def456")
+	if err != nil || got.String() != "checklistbank://taxon/def456" {
+		t.Errorf("ResolveOn = (%q, %v), want checklistbank://taxon/def456", got.String(), err)
 	}
 }
