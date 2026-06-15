@@ -1,35 +1,138 @@
 // Package checklistbank is the library behind the checklistbank command line:
-// the HTTP client, request shaping, and the typed data models for checklistbank.
+// the HTTP client, request shaping, and the typed data models for ChecklistBank.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
+// transient failures (429 and 5xx) that any public API throws under load.
 // Build your endpoint calls and JSON decoding on top of it.
 package checklistbank
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to checklistbank. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "checklistbank/dev (+https://github.com/tamnd/checklistbank-cli)"
-
 // Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at checklistbank.com; change it once you
-// know the real endpoints you want to read.
-const Host = "checklistbank.com"
+// domain.go claims.
+const Host = "api.checklistbank.org"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to checklistbank over HTTP.
+// DefaultUserAgent identifies the client to ChecklistBank. A real, honest
+// User-Agent is both polite and the thing most likely to keep you unblocked.
+const DefaultUserAgent = "checklistbank-cli/0.1.0"
+
+// Wire types — match the ChecklistBank JSON shapes exactly.
+
+type wireName struct {
+	ID              string `json:"id"`
+	ScientificName  string `json:"scientificName"`
+	Rank            string `json:"rank"`
+	Genus           string `json:"genus"`
+	SpecificEpithet string `json:"specificEpithet"`
+	Code            string `json:"code"`
+}
+
+type wireUsage struct {
+	ID         string    `json:"id"`
+	DatasetKey int       `json:"datasetKey"`
+	Status     string    `json:"status"`
+	Label      string    `json:"label"`
+	Name       wireName  `json:"name"`
+}
+
+type wireClassEntry struct {
+	Name string `json:"name"`
+	Rank string `json:"rank"`
+}
+
+type wireResult struct {
+	Usage          wireUsage        `json:"usage"`
+	Classification []wireClassEntry `json:"classification"`
+}
+
+type wireSearchResp struct {
+	Total  int          `json:"total"`
+	Result []wireResult `json:"result"`
+}
+
+type wireDataset struct {
+	Key   int    `json:"key"`
+	Title string `json:"title"`
+	Type  string `json:"type"`
+}
+
+type wireDatasetResp struct {
+	Total  int           `json:"total"`
+	Result []wireDataset `json:"result"`
+}
+
+// Taxon is the public record type: one taxonomic name from ChecklistBank.
+type Taxon struct {
+	ID             string `json:"id"              kit:"id"`
+	ScientificName string `json:"scientific_name"`
+	Rank           string `json:"rank"`
+	Genus          string `json:"genus"`
+	Species        string `json:"species"`
+	Status         string `json:"status"`
+	DatasetKey     int    `json:"dataset_key"`
+	Code           string `json:"code"`
+	Label          string `json:"label"`
+	Classification string `json:"classification"`
+}
+
+// Checklist is the public record type: one checklist/dataset from ChecklistBank.
+type Checklist struct {
+	ID    string `json:"id"    kit:"id"`
+	Title string `json:"title"`
+	Type  string `json:"type"`
+	Size  int    `json:"size"`
+}
+
+func taxonFromWire(r wireResult) *Taxon {
+	parts := make([]string, 0, len(r.Classification))
+	for _, c := range r.Classification {
+		if c.Name != "" {
+			parts = append(parts, c.Name)
+		}
+	}
+	return &Taxon{
+		ID:             r.Usage.ID,
+		ScientificName: r.Usage.Name.ScientificName,
+		Rank:           r.Usage.Name.Rank,
+		Genus:          r.Usage.Name.Genus,
+		Species:        r.Usage.Name.SpecificEpithet,
+		Status:         r.Usage.Status,
+		DatasetKey:     r.Usage.DatasetKey,
+		Code:           r.Usage.Name.Code,
+		Label:          r.Usage.Label,
+		Classification: strings.Join(parts, " > "),
+	}
+}
+
+func taxonFromUsage(u wireUsage) *Taxon {
+	return &Taxon{
+		ID:             u.ID,
+		ScientificName: u.Name.ScientificName,
+		Rank:           u.Name.Rank,
+		Genus:          u.Name.Genus,
+		Species:        u.Name.SpecificEpithet,
+		Status:         u.Status,
+		DatasetKey:     u.DatasetKey,
+		Code:           u.Name.Code,
+		Label:          u.Label,
+	}
+}
+
+// Client talks to ChecklistBank over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
@@ -40,21 +143,63 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults: a 30s timeout, a 300ms
+// minimum gap between requests, and three retries on transient errors.
 func NewClient() *Client {
 	return &Client{
 		HTTP:      &http.Client{Timeout: 30 * time.Second},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      300 * time.Millisecond,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// SearchTaxa queries /nameusage/search and returns matching taxa plus the total count.
+func (c *Client) SearchTaxa(ctx context.Context, query string, limit, offset int) ([]Taxon, int, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	u := BaseURL + "/nameusage/search?q=" + url.QueryEscape(query) +
+		"&limit=" + strconv.Itoa(limit) +
+		"&offset=" + strconv.Itoa(offset)
+
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, 0, err
+	}
+	return parseSearchResp(body)
+}
+
+// GetTaxon fetches a single taxon by dataset key and usage ID.
+func (c *Client) GetTaxon(ctx context.Context, datasetKey int, id string) (*Taxon, error) {
+	u := BaseURL + "/dataset/" + strconv.Itoa(datasetKey) + "/taxon/" + url.PathEscape(id)
+
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	return parseTaxonResp(body)
+}
+
+// ListDatasets queries /dataset and returns matching checklists plus the total count.
+func (c *Client) ListDatasets(ctx context.Context, query string, limit int) ([]Checklist, int, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	u := BaseURL + "/dataset?limit=" + strconv.Itoa(limit)
+	if query != "" {
+		u += "&q=" + url.QueryEscape(query)
+	}
+
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, 0, err
+	}
+	return parseDatasetResp(body)
+}
+
+// get fetches a URL and returns the response body, with pacing and retries.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,7 +209,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,16 +218,17 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
 	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -123,78 +269,41 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on checklistbank.com. It is a stand-in for the typed records you
-// will model from the real checklistbank endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `checklistbank cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// parseSearchResp decodes a raw /nameusage/search JSON response body into taxa + total.
+func parseSearchResp(body []byte) ([]Taxon, int, error) {
+	var resp wireSearchResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, 0, fmt.Errorf("decode search response: %w", err)
+	}
+	taxa := make([]Taxon, 0, len(resp.Result))
+	for _, r := range resp.Result {
+		taxa = append(taxa, *taxonFromWire(r))
+	}
+	return taxa, resp.Total, nil
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
+// parseTaxonResp decodes a raw single usage JSON response body into a Taxon.
+func parseTaxonResp(body []byte) (*Taxon, error) {
+	var u wireUsage
+	if err := json.Unmarshal(body, &u); err != nil {
+		return nil, fmt.Errorf("decode taxon response: %w", err)
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+	return taxonFromUsage(u), nil
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+// parseDatasetResp decodes a raw /dataset JSON response body into checklists + total.
+func parseDatasetResp(body []byte) ([]Checklist, int, error) {
+	var resp wireDatasetResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, 0, fmt.Errorf("decode dataset response: %w", err)
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	lists := make([]Checklist, 0, len(resp.Result))
+	for _, d := range resp.Result {
+		lists = append(lists, Checklist{
+			ID:    strconv.Itoa(d.Key),
+			Title: d.Title,
+			Type:  d.Type,
+		})
 	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
+	return lists, resp.Total, nil
 }
